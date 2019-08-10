@@ -4,7 +4,7 @@
 import unittest
 
 from trytond import backend
-from trytond.exceptions import UserError
+from trytond.model.exceptions import RequiredValidationError
 from trytond.pool import Pool
 from trytond.tests.test_tryton import activate_module, with_transaction
 from trytond.transaction import Transaction
@@ -364,7 +364,7 @@ class FieldCharTestCase(unittest.TestCase, CommonTestCaseMixin):
         "Test create char required without value"
         Char = Pool().get('test.char_required')
 
-        with self.assertRaises(UserError):
+        with self.assertRaises(RequiredValidationError):
             Char.create([{}])
 
     @with_transaction()
@@ -372,7 +372,7 @@ class FieldCharTestCase(unittest.TestCase, CommonTestCaseMixin):
         "Test create char required with empty"
         Char = Pool().get('test.char_required')
 
-        with self.assertRaises(UserError):
+        with self.assertRaises(RequiredValidationError):
             Char.create([{
                         'char': '',
                         }])
@@ -453,21 +453,34 @@ class FieldCharTranslatedTestCase(unittest.TestCase, CommonTestCaseMixin):
     def Char(self):
         return Pool().get('test.char_translate')
 
+    @with_transaction()
+    def test_translation_default_language_cache(self):
+        """Test set translation for default language does not fill transactional
+        cache with former value"""
+        pool = Pool()
+        Config = pool.get('ir.configuration')
+        Char = self.Char()
 
-@unittest.skipUnless(backend.name() == 'postgresql',
-    "unaccent works only on postgresql")
-class FieldCharUnaccentedTestCase(unittest.TestCase):
-    "Test Field Char with unaccented searches"
+        with Transaction().set_context(language=Config.get_language()):
+            char, = Char.create([{
+                        'char': "foo",
+                        }])
 
+            char.char = "bar"
+            char.save()
+
+            self.assertEqual(char.char, "bar")
+
+
+class UnaccentedTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        super(FieldCharUnaccentedTestCase, cls).setUpClass()
-        activate_module('tests')
+        super().setUpClass()
         cls._activate_extension()
 
     @classmethod
     def tearDownClass(cls):
-        super(FieldCharUnaccentedTestCase, cls).tearDownClass()
+        super().tearDownClass()
         cls._deactivate_extension()
 
     @classmethod
@@ -492,6 +505,17 @@ class FieldCharUnaccentedTestCase(unittest.TestCase):
     def _clear_unaccent_cache(cls):
         Database = backend.get('Database')
         Database._has_unaccent.clear()
+
+
+@unittest.skipUnless(backend.name() == 'postgresql',
+    "unaccent works only on postgresql")
+class FieldCharUnaccentedTestCase(UnaccentedTestCase):
+    "Test Field Char with unaccented searches"
+
+    @classmethod
+    def setUpClass(cls):
+        activate_module('tests')
+        super().setUpClass()
 
     @with_transaction()
     def test_normal_search(self):

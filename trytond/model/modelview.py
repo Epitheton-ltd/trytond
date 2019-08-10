@@ -5,18 +5,23 @@ from functools import wraps
 import copy
 import collections
 
+from trytond.exceptions import UserError
+from trytond.i18n import gettext
 from trytond.model import Model, fields
 from trytond.tools import ClassProperty, is_instance_method
 from trytond.pyson import PYSONDecoder, PYSONEncoder
 from trytond.transaction import Transaction
 from trytond.cache import Cache
 from trytond.pool import Pool
-from trytond.exceptions import UserError
 from trytond.rpc import RPC
 
 from .fields import on_change_result
 
 __all__ = ['ModelView']
+
+
+class AccessButtonError(UserError):
+    pass
 
 
 def _find(tree, element):
@@ -113,8 +118,8 @@ class ModelView(Model):
     @classmethod
     def __setup__(cls):
         super(ModelView, cls).__setup__()
-        cls.__rpc__['fields_view_get'] = RPC()
-        cls.__rpc__['view_toolbar_get'] = RPC()
+        cls.__rpc__['fields_view_get'] = RPC(cache=dict(days=1))
+        cls.__rpc__['view_toolbar_get'] = RPC(cache=dict(days=1))
         cls.__rpc__['on_change'] = RPC(instantiate=0)
         cls.__rpc__['on_change_with'] = RPC(instantiate=0)
         cls._buttons = {}
@@ -131,13 +136,17 @@ class ModelView(Model):
                 callables[name] = attr
 
         methods = {
+            '_done': set(),
             'depends': collections.defaultdict(set),
             'depend_methods': collections.defaultdict(set),
             'change': collections.defaultdict(set),
             }
         cls.__change_buttons = methods['change']
 
-        def get_callable_attributes(name, method):
+        def set_methods(name):
+            if name in methods['_done']:
+                return
+            methods['_done'].add(name)
             for parent_cls in cls.__mro__:
                 parent_meth = getattr(parent_cls, name, None)
                 if not parent_meth:
@@ -146,9 +155,6 @@ class ModelView(Model):
                     parent_value = getattr(parent_meth, attr, None)
                     if parent_value:
                         methods[attr][name] |= parent_value
-
-        for name, method in callables.items():
-            get_callable_attributes(name, method)
 
         def setup_field(field_name, field, attribute):
             if attribute == 'selection_change_with':
@@ -159,12 +165,12 @@ class ModelView(Model):
                     return
             else:
                 function_name = '%s_%s' % (attribute, field_name)
-            if not getattr(cls, function_name, None):
+            function = getattr(cls, function_name, None)
+            if not function:
                 return
 
-            function = getattr(cls, function_name, None)
-            setattr(field, attribute,
-                getattr(field, attribute) | methods['depends'][function_name])
+            set_methods(function_name)
+            setattr(field, attribute, methods['depends'][function_name])
 
             meth_names = list(methods['depend_methods'][function_name])
             meth_done = set()
@@ -172,6 +178,7 @@ class ModelView(Model):
                 meth_name = meth_names.pop()
                 assert callable(getattr(cls, meth_name)), \
                     "%s.%s not callable" % (cls, meth_name)
+                set_methods(meth_name)
                 setattr(field, attribute,
                     getattr(field, attribute) | methods['depends'][meth_name])
                 meth_names += list(
@@ -207,6 +214,13 @@ class ModelView(Model):
             else:
                 cls.__rpc__.setdefault(button,
                     RPC(instantiate=0, result=on_change_result))
+
+            for parent_cls in cls.__mro__:
+                parent_meth = getattr(parent_cls, button, None)
+                if not parent_meth:
+                    continue
+                cls.__change_buttons[button] |= getattr(
+                    parent_meth, 'change', set())
 
     @classmethod
     def fields_view_get(cls, view_id=None, view_type='form'):
@@ -249,7 +263,6 @@ class ModelView(Model):
             if view.inherit:
                 inherit_view_id = view.id
                 view = view.inherit
-            view_id = view.id
 
         # if a view was found
         if view:
@@ -261,17 +274,18 @@ class ModelView(Model):
             # Check if view is not from an inherited model
             if view.model != cls.__name__:
                 Inherit = pool.get(view.model)
-                result['arch'] = Inherit.fields_view_get(
-                        result['view_id'])['arch']
-                view_id = inherit_view_id
+                result['arch'] = Inherit.fields_view_get(view.id)['arch']
+                real_view_id = inherit_view_id
+            else:
+                real_view_id = view.id
 
             # get all views which inherit from (ie modify) this view
             views = View.search([
                     'OR', [
-                        ('inherit', '=', view_id),
+                        ('inherit', '=', real_view_id),
                         ('model', '=', cls.__name__),
                         ], [
-                        ('id', '=', view_id),
+                        ('id', '=', real_view_id),
                         ('inherit', '!=', None),
                         ],
                     ])
@@ -331,7 +345,7 @@ class ModelView(Model):
             result['type'] = view_type
             result['arch'] = xml
             result['field_childs'] = None
-            result['view_id'] = 0
+            result['view_id'] = view_id
 
         # Update arch and compute fields from arch
         parser = etree.XMLParser(remove_blank_text=True)
@@ -347,13 +361,16 @@ class ModelView(Model):
     @classmethod
     def view_toolbar_get(cls):
         """
-        Returns the model specific actions.
+        Returns the model specific actions and exports.
         A dictionary with keys:
             - print: a list of available reports
             - action: a list of available actions
             - relate: a list of available relations
+            - exports: a list of available exports
         """
-        Action = Pool().get('ir.action.keyword')
+        pool = Pool()
+        Action = pool.get('ir.action.keyword')
+        Export = pool.get('ir.export')
         key = cls.__name__
         result = cls._view_toolbar_get_cache.get(key)
         if result:
@@ -361,10 +378,14 @@ class ModelView(Model):
         prints = Action.get_keyword('form_print', (cls.__name__, -1))
         actions = Action.get_keyword('form_action', (cls.__name__, -1))
         relates = Action.get_keyword('form_relate', (cls.__name__, -1))
+        exports = Export.search_read(
+            [('resource', '=', cls.__name__)],
+            fields_names=['name', 'export_fields.name'])
         result = {
             'print': prints,
             'action': actions,
             'relate': relates,
+            'exports': exports,
             }
         cls._view_toolbar_get_cache.set(key, result)
         return result
@@ -589,7 +610,12 @@ class ModelView(Model):
 
             change = cls.__change_buttons[button_name]
             if change:
-                element.set('change', encoder.encode(list(change)))
+                change = list(change)
+                # Add id to change if the button is not cached
+                # Not having the id increase the efficiency of the cache
+                if cls.__rpc__[button_name].cache:
+                    change.append('id')
+                element.set('change', encoder.encode(change))
             if not is_instance_method(cls, button_name):
                 element.set('type', 'class')
             else:
@@ -642,9 +668,10 @@ class ModelView(Model):
                     func.__name__)
                 if button_groups:
                     if not groups & button_groups:
-                        raise UserError(
-                            'Calling button %s on %s is not allowed!'
-                            % (func.__name__, cls.__name__))
+                        raise AccessButtonError(
+                            gettext('ir.msg_access_button_error',
+                                button=func.__name__,
+                                model=cls.__name__))
                 else:
                     ModelAccess.check(cls.__name__, 'write')
 

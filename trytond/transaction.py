@@ -1,6 +1,7 @@
 # This file is part of Tryton.  The COPYRIGHT file at the top level of
 # this repository contains the full copyright notices and license terms.
 import logging
+import time
 from threading import local
 from sql import Flavor
 
@@ -53,6 +54,7 @@ class Transaction(object):
     delete_records = None
     delete = None  # TODO check to merge with delete_records
     timestamp = None
+    started_at = None
 
     def __new__(cls, new=False):
         transactions = cls._local.transactions
@@ -64,6 +66,13 @@ class Transaction(object):
         else:
             instance = transactions[-1]
         return instance
+
+    @staticmethod
+    def monotonic_time():
+        try:
+            return time.monotonic_ns()
+        except AttributeError:
+            return time.monotonic()
 
     @property
     def tasks(self):
@@ -78,7 +87,7 @@ class Transaction(object):
             LRUDict(config.getint('cache', 'model')))
 
     def start(self, database_name, user, readonly=False, context=None,
-            close=False, autocommit=False, _nocache=False):
+            close=False, autocommit=False):
         '''
         Start transaction
         '''
@@ -87,6 +96,10 @@ class Transaction(object):
         assert self.database is None
         assert self.close is None
         assert self.context is None
+        # Compute started_at before connect to ensure
+        # it is strictly before all transactions started after
+        # but it may be also before transactions started before
+        self.started_at = self.monotonic_time()
         if not database_name:
             database = Database().connect()
         else:
@@ -105,11 +118,10 @@ class Transaction(object):
         self.timestamp = {}
         self.counter = 0
         self._datamanagers = []
-        self._nocache = _nocache
-        if not _nocache:
+        if database_name:
             from trytond.cache import Cache
             try:
-                Cache.clean(database.name)
+                Cache.sync(self)
             except BaseException:
                 self.stop(False)
                 raise
@@ -152,8 +164,11 @@ class Transaction(object):
                 for func, args, kwargs in self._atexit:
                     func(*args, **kwargs)
         finally:
-            current_instance = transactions.pop()
-        assert current_instance is self, transactions
+            transactions.reverse()
+            try:
+                transactions.remove(self)
+            finally:
+                transactions.reverse()
 
     def set_context(self, context=None, **kwargs):
         if context is None:
@@ -188,14 +203,14 @@ class Transaction(object):
         self._local.transactions.append(transaction)
         return transaction
 
-    def new_transaction(self, autocommit=False, readonly=False,
-            _nocache=False):
+    def new_transaction(self, autocommit=False, readonly=False):
         transaction = Transaction(new=True)
         return transaction.start(self.database.name, self.user,
             context=self.context, close=self.close, readonly=readonly,
-            autocommit=autocommit, _nocache=_nocache)
+            autocommit=autocommit)
 
     def commit(self):
+        from trytond.cache import Cache
         try:
             if self._datamanagers:
                 for datamanager in self._datamanagers:
@@ -204,6 +219,7 @@ class Transaction(object):
                     datamanager.commit(self)
                 for datamanager in self._datamanagers:
                     datamanager.tpc_vote(self)
+            Cache.commit(self)
             self.connection.commit()
         except:
             self.rollback()
@@ -216,19 +232,15 @@ class Transaction(object):
                 logger.critical('A datamanager raised an exception in'
                     ' tpc_finish, the data might be inconsistant',
                     exc_info=True)
-        if not self._nocache:
-            from trytond.cache import Cache
-            Cache.resets(self.database.name)
 
     def rollback(self):
+        from trytond.cache import Cache
         for cache in self.cache.values():
             cache.clear()
         for datamanager in self._datamanagers:
             datamanager.tpc_abort(self)
+        Cache.rollback(self)
         self.connection.rollback()
-        if not self._nocache:
-            from trytond.cache import Cache
-            Cache.resets(self.database.name)
 
     def join(self, datamanager):
         try:
